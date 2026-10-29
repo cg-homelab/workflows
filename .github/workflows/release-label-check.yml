@@ -1,0 +1,81 @@
+name: Release label check
+
+# Reusable workflow: fail a pull request that carries more than one release/*
+# label, and show in the step summary which bump semver-tag.yml will apply
+# when it merges. Reads the labels from the event payload; no API calls.
+
+on:
+  workflow_call:
+
+jobs:
+  check:
+    name: Release label
+    runs-on: ubuntu-latest
+    permissions: {}
+    # Rapid label changes start several runs; only the latest label set counts.
+    concurrency:
+      group: release-label-check-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check release/* labels
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "::error::release-label-check must be called from a pull_request event (got ${GITHUB_EVENT_NAME})"
+            exit 1
+          fi
+
+          mapfile -t release_labels < <(jq -r '.[] | select(startswith("release/"))' <<<"$LABELS")
+
+          summary() {
+            {
+              echo "## Release label"
+              echo
+              echo "| | |"
+              echo "| --- | --- |"
+              echo "| PR | #${PR_NUMBER} |"
+              if (( ${#release_labels[@]} == 0 )); then
+                echo "| release/* labels | (none) |"
+              else
+                local list='' label
+                for label in "${release_labels[@]}"; do
+                  list+="\`${label}\`, "
+                done
+                echo "| release/* labels | ${list%, } |"
+              fi
+              echo "| $1 | $2 |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if (( ${#release_labels[@]} > 1 )); then
+            msg="PR #${PR_NUMBER} has ${#release_labels[@]} release/* labels (${release_labels[*]}); keep exactly one, or none for the default bump"
+            echo "::error title=Release label::${msg}"
+            summary "Result" "Failed: more than one release/* label"
+            exit 1
+          fi
+
+          case "${release_labels[0]:-}" in
+            '')
+              if [[ "$AUTHOR_TYPE" == Bot ]]; then
+                bump="skip (bot author ${AUTHOR} without a release/* label; default bump if the caller sets skip_bots: false)"
+              else
+                bump="default bump, patch unless the caller sets default_bump (no release/* label)"
+              fi
+              ;;
+            release/skip) bump="skip (no tag)" ;;
+            release/major) bump="major" ;;
+            release/minor) bump="minor" ;;
+            release/patch) bump="patch" ;;
+            *)
+              echo "::error title=Release label::Unknown label '${release_labels[0]}'; use release/major, release/minor, release/patch or release/skip"
+              summary "Result" "Failed: unknown release/* label"
+              exit 1
+              ;;
+          esac
+          echo "::notice title=Release label::Merging PR #${PR_NUMBER} will bump: ${bump}"
+          summary "Bump on merge" "$bump"

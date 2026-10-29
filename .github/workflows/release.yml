@@ -1,0 +1,16 @@
+name: Release
+
+# This repo versions itself with its own reusable workflow (local reference,
+# so the current commit's semver-tag.yml is used and no bootstrap tag is needed).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  tag:
+    uses: ./.github/workflows/semver-tag.yml

@@ -1,0 +1,388 @@
+name: Semver tag
+
+# Reusable workflow: on a push to a branch, find the pull request that was
+# merged into it, pick the bump level from its release/* label and push an
+# annotated semver tag on the pushed commit. See README.md for the contract.
+
+on:
+  workflow_call:
+    inputs:
+      default_bump:
+        description: "Bump level when the PR has no release/* label: major, minor or patch."
+        type: string
+        required: false
+        default: patch
+      create_release:
+        description: "Also create a GitHub Release with generated notes for the tag (also on a re-run of an already-tagged commit, if the release is missing)."
+        type: boolean
+        required: false
+        default: false
+      skip_bots:
+        description: "Skip PRs opened by bots (user.type == Bot) unless they carry an explicit release/* label."
+        type: boolean
+        required: false
+        default: true
+      tag_prefix:
+        description: "Tag prefix, also used to filter existing tags. Empty, or a letter followed by letters, '_' and '-'."
+        type: string
+        required: false
+        default: v
+    outputs:
+      tag:
+        description: "The new tag, or the existing tag on an already-tagged commit; empty when nothing was tagged."
+        value: ${{ jobs.tag.outputs.tag }}
+      previous_tag:
+        description: "The latest release tag reachable from the commit before this run (PREFIX0.0.0 when there was none); empty when skipped."
+        value: ${{ jobs.tag.outputs.previous_tag }}
+      level:
+        description: "The applied bump level: major, minor or patch; empty when skipped."
+        value: ${{ jobs.tag.outputs.level }}
+      skipped:
+        description: "'true' when no new tag was created, 'false' otherwise."
+        value: ${{ jobs.tag.outputs.skipped }}
+
+jobs:
+  tag:
+    name: Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: semver-tag-${{ github.repository }}-${{ inputs.tag_prefix }}
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.result.outputs.tag }}
+      previous_tag: ${{ steps.result.outputs.previous_tag }}
+      level: ${{ steps.result.outputs.level }}
+      skipped: ${{ steps.result.outputs.skipped }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout (full history and tags)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs
+        env:
+          PREFIX: ${{ inputs.tag_prefix }}
+          DEFAULT_BUMP: ${{ inputs.default_bump }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PREFIX" =~ ^([A-Za-z][A-Za-z_-]*)?$ ]]; then
+            echo "::error::tag_prefix '${PREFIX}' is invalid: use empty, or a letter followed by letters, '_' and '-'"
+            exit 1
+          fi
+          case "$DEFAULT_BUMP" in
+            major|minor|patch) ;;
+            *)
+              echo "::error::default_bump '${DEFAULT_BUMP}' is invalid: use major, minor or patch"
+              exit 1
+              ;;
+          esac
+
+      - name: Check whether the commit is already tagged
+        id: existing
+        env:
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          existing=$(git tag --points-at "$GITHUB_SHA" \
+            | { grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" || true; } \
+            | sort -V | tail -n 1)
+          if [[ -n "$existing" ]]; then
+            # Highest reachable release tag below the existing one; only used
+            # as --notes-start-tag if the release has to be (re)created.
+            previous=$(git tag --merged "$GITHUB_SHA" --list "${PREFIX}[0-9]*" \
+              | { grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" || true; } \
+              | sort -V -u | awk -v t="$existing" '$0 == t { print prev; exit } { prev = $0 }')
+            reason="commit ${GITHUB_SHA} is already tagged ${existing}"
+            echo "::notice title=Semver tag skipped::${reason}"
+            {
+              echo "skip=true"
+              echo "tag=${existing}"
+              echo "previous_tag=${previous}"
+              echo "reason=${reason}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find the merged pull request
+        id: pr
+        if: steps.existing.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          set_output() {
+            local delim
+            delim="EOF_$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$1" "$delim" "$2" "$delim" >> "$GITHUB_OUTPUT"
+          }
+
+          # The commit -> PR association can lag a merge by a few seconds,
+          # so retry before concluding that this was a direct push.
+          pr=''
+          api_ok=false
+          for attempt in 1 2 3; do
+            if pulls=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"); then
+              api_ok=true
+              # Prefer the PR into the pushed branch whose merge produced this
+              # exact commit; otherwise the most recently merged PR into it.
+              pr=$(jq -c --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" '
+                map(select(.merged_at != null))
+                | (map(select(.merge_commit_sha == $sha and .base.ref == $ref)) | first)
+                  // (map(select(.base.ref == $ref)) | sort_by(.merged_at) | last)
+                  // empty
+              ' <<<"$pulls")
+              if [[ -n "$pr" ]]; then
+                break
+              fi
+            else
+              echo "::warning::Attempt ${attempt}: GitHub API call for the PRs of ${GITHUB_SHA} failed"
+            fi
+            if (( attempt < 3 )); then
+              sleep 5
+            fi
+          done
+
+          if [[ -z "$pr" ]]; then
+            if [[ "$api_ok" != true ]]; then
+              echo "::error::Could not list the pull requests of ${GITHUB_SHA}"
+              exit 1
+            fi
+            reason="no merged pull request into ${GITHUB_REF_NAME} found for ${GITHUB_SHA} (direct push)"
+            echo "::notice title=Semver tag skipped::${reason}"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            set_output reason "$reason"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          set_output number "$(jq -r '.number' <<<"$pr")"
+          set_output title "$(jq -r '.title' <<<"$pr")"
+          set_output author "$(jq -r '.user.login' <<<"$pr")"
+          set_output author_type "$(jq -r '.user.type' <<<"$pr")"
+          set_output labels "$(jq -c '[.labels[].name]' <<<"$pr")"
+
+      - name: Decide the bump level
+        id: level
+        if: steps.pr.outputs.skip == 'false'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_LABELS: ${{ steps.pr.outputs.labels }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+          AUTHOR_TYPE: ${{ steps.pr.outputs.author_type }}
+          SKIP_BOTS: ${{ inputs.skip_bots }}
+          DEFAULT_BUMP: ${{ inputs.default_bump }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_labels < <(jq -r '.[] | select(startswith("release/"))' <<<"$PR_LABELS")
+          known=()
+          for label in "${release_labels[@]}"; do
+            case "$label" in
+              release/skip|release/major|release/minor|release/patch) known+=("$label") ;;
+              *) echo "::warning::PR #${PR_NUMBER}: ignoring unknown label '${label}'" ;;
+            esac
+          done
+          has() {
+            local l
+            for l in "${known[@]}"; do
+              if [[ "$l" == "$1" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          if (( ${#known[@]} > 1 )); then
+            echo "::warning::PR #${PR_NUMBER} has ${#known[@]} release labels (${known[*]}); using the one with the highest precedence"
+          fi
+
+          skip=false
+          level=''
+          reason=''
+          if has release/skip; then
+            skip=true
+            reason="PR #${PR_NUMBER} is labelled release/skip"
+          elif has release/major; then
+            level="major"
+          elif has release/minor; then
+            level="minor"
+          elif has release/patch; then
+            level="patch"
+          elif [[ "$AUTHOR_TYPE" == Bot && "$SKIP_BOTS" == true ]]; then
+            skip=true
+            reason="PR #${PR_NUMBER} was opened by bot ${AUTHOR} and has no release/* label"
+          else
+            level="$DEFAULT_BUMP"
+          fi
+
+          if [[ "$skip" == true ]]; then
+            echo "::notice title=Semver tag skipped::${reason}"
+          fi
+          {
+            echo "skip=${skip}"
+            echo "level=${level}"
+            echo "reason=${reason}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute the next version
+        id: version
+        if: steps.level.outputs.skip == 'false'
+        env:
+          PREFIX: ${{ inputs.tag_prefix }}
+          LEVEL: ${{ steps.level.outputs.level }}
+        run: |
+          set -euo pipefail
+          # Strict MAJOR.MINOR.PATCH only: pre-release and other tags are ignored.
+          semver_tags() {
+            grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" || true
+          }
+          # The previous tag must be reachable from the commit being tagged, so
+          # tags on other branches or on newer commits do not count.
+          previous=$(git tag --merged "$GITHUB_SHA" --list "${PREFIX}[0-9]*" | semver_tags | sort -V | tail -n 1)
+          highest=$(git tag --list "${PREFIX}[0-9]*" | semver_tags | sort -V | tail -n 1)
+          if [[ -n "$highest" && "$highest" != "$previous" ]]; then
+            echo "::warning::The highest release tag in the repository is ${highest}, but the highest one reachable from ${GITHUB_SHA} is ${previous:-none}; bumping from the reachable one"
+          fi
+          previous="${previous:-${PREFIX}0.0.0}"
+
+          IFS=. read -r major minor patch <<<"${previous#"$PREFIX"}"
+          # 10# forces base 10 so components with leading zeros are not octal.
+          major=$((10#$major))
+          minor=$((10#$minor))
+          patch=$((10#$patch))
+          case "$LEVEL" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *)
+              echo "::error::Unknown bump level '${LEVEL}'"
+              exit 1
+              ;;
+          esac
+          tag="${PREFIX}${major}.${minor}.${patch}"
+
+          echo "${previous} -> ${tag} (${LEVEL})"
+          {
+            echo "previous_tag=${previous}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the tag
+        if: steps.level.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+        run: |
+          set -euo pipefail
+          # Race guard: never move a tag that someone else pushed meanwhile.
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]]; then
+            echo "::error::Tag ${TAG} already exists on origin; refusing to overwrite it"
+            exit 1
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            tag -a "$TAG" -m "${TAG}: PR #${PR_NUMBER} ${PR_TITLE}" "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}"
+          echo "::notice title=Semver tag::Tagged ${GITHUB_SHA} as ${TAG}"
+
+      # Runs for a new tag and for an already-tagged commit, so re-running a
+      # run whose tag was pushed but whose release failed creates the release.
+      - name: Create the GitHub Release
+        id: release
+        if: inputs.create_release && (steps.level.outputs.skip == 'false' || steps.existing.outputs.skip == 'true')
+        env:
+          TAG: ${{ steps.version.outputs.tag || steps.existing.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag || steps.existing.outputs.previous_tag }}
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice title=Semver tag::Release ${TAG} already exists"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes)
+          if [[ -n "$PREVIOUS_TAG" && "$PREVIOUS_TAG" != "${PREFIX}0.0.0" ]]; then
+            args+=(--notes-start-tag "$PREVIOUS_TAG")
+          fi
+          gh release create "$TAG" "${args[@]}"
+          echo "::notice title=Semver tag::Created release ${TAG}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set outputs and write the summary
+        id: result
+        env:
+          EXISTING_SKIP: ${{ steps.existing.outputs.skip }}
+          EXISTING_TAG: ${{ steps.existing.outputs.tag }}
+          EXISTING_REASON: ${{ steps.existing.outputs.reason }}
+          PR_SKIP: ${{ steps.pr.outputs.skip }}
+          PR_REASON: ${{ steps.pr.outputs.reason }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          PR_AUTHOR: ${{ steps.pr.outputs.author }}
+          PR_LABELS: ${{ steps.pr.outputs.labels }}
+          LEVEL_SKIP: ${{ steps.level.outputs.skip }}
+          LEVEL_REASON: ${{ steps.level.outputs.reason }}
+          LEVEL: ${{ steps.level.outputs.level }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+          NEW_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_CREATED: ${{ steps.release.outputs.created }}
+        run: |
+          set -euo pipefail
+          skipped=true
+          tag=''
+          previous=''
+          level=''
+          if [[ "$EXISTING_SKIP" == true ]]; then
+            tag="$EXISTING_TAG"
+            reason="$EXISTING_REASON"
+          elif [[ "$PR_SKIP" == true ]]; then
+            reason="$PR_REASON"
+          elif [[ "$LEVEL_SKIP" == true ]]; then
+            reason="$LEVEL_REASON"
+          elif [[ -n "$NEW_TAG" ]]; then
+            skipped=false
+            tag="$NEW_TAG"
+            previous="$PREVIOUS_TAG"
+            level="$LEVEL"
+            reason=''
+          else
+            echo "::error::Internal error: no tag computed and no skip reason recorded"
+            exit 1
+          fi
+          {
+            echo "skipped=${skipped}"
+            echo "tag=${tag}"
+            echo "previous_tag=${previous}"
+            echo "level=${level}"
+          } >> "$GITHUB_OUTPUT"
+
+          md() { local s="${1//|/\\|}"; printf '%s' "${s//$'\n'/ }"; }
+          {
+            echo "## Semver tag"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            if [[ -n "$PR_NUMBER" ]]; then
+              echo "| PR | #${PR_NUMBER} $(md "$PR_TITLE") (@$(md "$PR_AUTHOR")) |"
+              labels_md=$(jq -r 'if length == 0 then "(none)" else map("`" + . + "`") | join(", ") end' <<<"$PR_LABELS")
+              echo "| Labels | $(md "$labels_md") |"
+            fi
+            if [[ "$skipped" == true ]]; then
+              echo "| Result | Skipped: $(md "$reason") |"
+              if [[ -n "$tag" ]]; then
+                echo "| Existing tag | \`${tag}\` |"
+              fi
+            else
+              echo "| Level | ${level} |"
+              echo "| Tag | \`${previous}\` &rarr; \`${tag}\` |"
+            fi
+            case "$RELEASE_CREATED" in
+              true) echo "| Release | created on this run |" ;;
+              false) echo "| Release | already existed |" ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
