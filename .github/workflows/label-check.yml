@@ -1,0 +1,12 @@
+name: Label check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  release-label:
+    uses: ./.github/workflows/release-label-check.yml

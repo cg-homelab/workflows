@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Dependabot does not update docker:// references: bump this pin by hand.
+      - name: Lint workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
